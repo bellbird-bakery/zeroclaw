@@ -1979,6 +1979,7 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
+    pub webchat: Option<WebchatConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -1999,6 +2000,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            webchat: None,
         }
     }
 }
@@ -2080,6 +2082,27 @@ pub struct MattermostConfig {
 pub struct WebhookConfig {
     pub port: u16,
     pub secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebchatConfig {
+    /// Enable webchat gateway endpoints
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum conversation history messages per session
+    #[serde(default = "default_webchat_max_history")]
+    pub max_history: usize,
+    /// Session timeout in seconds (inactive sessions are cleaned up)
+    #[serde(default = "default_webchat_session_timeout_secs")]
+    pub session_timeout_secs: u64,
+}
+
+fn default_webchat_max_history() -> usize {
+    50
+}
+
+fn default_webchat_session_timeout_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3242,6 +3265,7 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                webchat: None,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -3746,6 +3770,7 @@ allowed_users = ["@ops:matrix.org"]
             lark: None,
             dingtalk: None,
             qq: None,
+            webchat: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -3909,6 +3934,7 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            webchat: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

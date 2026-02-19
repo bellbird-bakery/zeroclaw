@@ -7,28 +7,34 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::channels::{Channel, SendMessage, WhatsAppChannel};
+use crate::channels::{build_system_prompt, Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::tools;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json,
+    },
     routing::{get, post},
     Router,
 };
+use futures_util::stream::Stream;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -199,6 +205,92 @@ impl IdempotencyStore {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// WEBCHAT SESSION STORE
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Timeout for webchat message processing (LLM + tools).
+/// Matches `CHANNEL_MESSAGE_TIMEOUT_SECS` for parity with channel paths.
+const WEBCHAT_MESSAGE_TIMEOUT_SECS: u64 = 300;
+
+/// In-memory per-session conversation history for webchat.
+#[derive(Debug)]
+pub struct WebchatSessionStore {
+    max_history: usize,
+    session_timeout: Duration,
+    sessions: Mutex<HashMap<String, WebchatSession>>,
+}
+
+#[derive(Debug)]
+struct WebchatSession {
+    messages: Vec<ChatMessage>,
+    last_active: Instant,
+}
+
+impl WebchatSessionStore {
+    fn new(max_history: usize, session_timeout_secs: u64) -> Self {
+        Self {
+            max_history,
+            session_timeout: Duration::from_secs(session_timeout_secs),
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get or create a session, cleaning up expired sessions lazily.
+    fn get_history(&self, session_key: &str) -> Vec<ChatMessage> {
+        let mut sessions = self.sessions.lock();
+        self.cleanup_expired(&mut sessions);
+        sessions
+            .get(session_key)
+            .map(|s| s.messages.clone())
+            .unwrap_or_default()
+    }
+
+    /// Append messages to session history, truncating to max_history.
+    fn append_messages(&self, session_key: &str, msgs: &[ChatMessage]) {
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .entry(session_key.to_owned())
+            .or_insert_with(|| WebchatSession {
+                messages: Vec::new(),
+                last_active: Instant::now(),
+            });
+        session.messages.extend_from_slice(msgs);
+        if session.messages.len() > self.max_history {
+            let drain_count = session.messages.len() - self.max_history;
+            session.messages.drain(..drain_count);
+        }
+        session.last_active = Instant::now();
+    }
+
+    fn clear_session(&self, session_key: &str) -> bool {
+        self.sessions.lock().remove(session_key).is_some()
+    }
+
+    fn cleanup_expired(&self, sessions: &mut HashMap<String, WebchatSession>) {
+        sessions.retain(|_, s| s.last_active.elapsed() < self.session_timeout);
+    }
+}
+
+/// Wraps `tokio::sync::mpsc::Receiver` as a `Stream` for SSE.
+struct ReceiverStream<T> {
+    inner: tokio::sync::mpsc::Receiver<T>,
+}
+
+impl<T> ReceiverStream<T> {
+    fn new(rx: tokio::sync::mpsc::Receiver<T>) -> Self {
+        Self { inner: rx }
+    }
+}
+
+impl<T> Stream for ReceiverStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.poll_recv(cx)
+    }
+}
+
 fn parse_client_ip(value: &str) -> Option<IpAddr> {
     let value = value.trim().trim_matches('"').trim();
     if value.is_empty() {
@@ -276,6 +368,12 @@ pub struct AppState {
     pub whatsapp_app_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// Tools registry for webchat tool-call loop
+    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    /// Webchat session store (present when webchat is enabled)
+    pub webchat_sessions: Option<Arc<WebchatSessionStore>>,
+    /// System prompt for webchat sessions
+    pub webchat_system_prompt: Option<Arc<str>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -335,7 +433,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -349,6 +447,50 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     ));
+
+    // ── Webchat (if configured) ──────────────────────────────────
+    let webchat_enabled = config
+        .channels_config
+        .webchat
+        .as_ref()
+        .is_some_and(|wc| wc.enabled);
+    let webchat_sessions = if webchat_enabled {
+        let wc = config.channels_config.webchat.as_ref().unwrap();
+        Some(Arc::new(WebchatSessionStore::new(
+            wc.max_history,
+            wc.session_timeout_secs,
+        )))
+    } else {
+        None
+    };
+    let webchat_system_prompt: Option<Arc<str>> = if webchat_enabled {
+        let skills = crate::skills::load_skills(&config.workspace_dir);
+        let tool_descs: Vec<(&str, &str)> = tools_registry
+            .iter()
+            .map(|t| {
+                let spec = t.spec();
+                // Leak is bounded: one allocation per gateway start.
+                let name: &'static str = Box::leak(spec.name.clone().into_boxed_str());
+                let desc: &'static str = Box::leak(spec.description.clone().into_boxed_str());
+                (name, desc)
+            })
+            .collect();
+        let mut prompt = build_system_prompt(
+            &config.workspace_dir,
+            &model,
+            &tool_descs,
+            &skills,
+            Some(&config.identity),
+            None,
+        );
+        prompt.push_str(&crate::agent::loop_::build_tool_instructions(
+            tools_registry.as_ref(),
+        ));
+        Some(Arc::from(prompt.as_str()))
+    } else {
+        None
+    };
+
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -440,6 +582,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /whatsapp  — Meta webhook verification");
         println!("  POST /whatsapp  — WhatsApp message webhook");
     }
+    if webchat_enabled {
+        println!("  POST /webchat/send    — send message (SSE streaming)");
+        println!("  GET  /webchat/history — get session history");
+        println!("  DELETE /webchat/history — clear session history");
+    }
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
     if let Some(code) = pairing.pairing_code() {
@@ -477,16 +624,28 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
         observer,
+        tools_registry,
+        webchat_sessions,
+        webchat_system_prompt,
     };
 
     // Build router with middleware
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
-        .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/whatsapp", post(handle_whatsapp_message));
+
+    if webchat_enabled {
+        app = app.route("/webchat/send", post(handle_webchat_send)).route(
+            "/webchat/history",
+            get(handle_webchat_history).delete(handle_webchat_clear),
+        );
+    }
+
+    let app = app
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
@@ -967,6 +1126,278 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// WEBCHAT HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Webchat send request body
+#[derive(serde::Deserialize)]
+pub struct WebchatSendBody {
+    pub session_key: String,
+    pub message: String,
+}
+
+/// Webchat history query params
+#[derive(serde::Deserialize)]
+pub struct WebchatHistoryQuery {
+    pub session_key: String,
+}
+
+/// Helper: authenticate webchat request via bearer token (reuses pairing auth).
+fn authenticate_webchat(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// POST /webchat/send — send a message and receive SSE-streamed response
+#[allow(clippy::too_many_lines)]
+async fn handle_webchat_send(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<WebchatSendBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let client_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&client_key) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many requests. Please retry later.",
+                "retry_after": RATE_LIMIT_WINDOW_SECS,
+            })),
+        ));
+    }
+
+    authenticate_webchat(&state, &headers)?;
+
+    let Some(ref sessions) = state.webchat_sessions else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Webchat not configured"})),
+        ));
+    };
+
+    let Json(send_body) = body.map_err(|e| {
+        tracing::warn!("Webchat JSON parse error: {e}");
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid JSON body. Expected: {\"session_key\": \"...\", \"message\": \"...\"}"
+            })),
+        )
+    })?;
+
+    if send_body.session_key.is_empty() || send_body.message.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_key and message must be non-empty"})),
+        ));
+    }
+
+    // Build conversation history
+    let session_key = send_body.session_key.clone();
+    let user_message = send_body.message.clone();
+    let mut history = Vec::new();
+
+    // System prompt
+    if let Some(ref sys_prompt) = state.webchat_system_prompt {
+        history.push(ChatMessage {
+            role: "system".to_string(),
+            content: sys_prompt.to_string(),
+        });
+    }
+
+    // Session history
+    let session_history = sessions.get_history(&session_key);
+    history.extend(session_history);
+
+    // New user message
+    history.push(ChatMessage {
+        role: "user".to_string(),
+        content: user_message.clone(),
+    });
+
+    // Create delta channel for SSE streaming
+    let (delta_tx, delta_rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    // Spawn the tool-call loop in a background task
+    let provider = Arc::clone(&state.provider);
+    let tools_registry = Arc::clone(&state.tools_registry);
+    let observer = Arc::clone(&state.observer);
+    let model = state.model.clone();
+    let temperature = state.temperature;
+    let sessions_clone = Arc::clone(sessions);
+    let provider_name = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            Duration::from_secs(WEBCHAT_MESSAGE_TIMEOUT_SECS),
+            crate::agent::loop_::run_tool_call_loop(
+                provider.as_ref(),
+                &mut history,
+                tools_registry.as_ref(),
+                observer.as_ref(),
+                &provider_name,
+                &model,
+                temperature,
+                true, // silent — no terminal output
+                None, // no approval manager
+                "webchat",
+                0, // default max iterations
+                Some(delta_tx.clone()),
+            ),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(final_text)) => {
+                // Save user + assistant messages to session
+                sessions_clone.append_messages(
+                    &session_key,
+                    &[
+                        ChatMessage {
+                            role: "user".to_string(),
+                            content: user_message,
+                        },
+                        ChatMessage {
+                            role: "assistant".to_string(),
+                            content: final_text,
+                        },
+                    ],
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Webchat tool-call loop error: {e:#}");
+                let _ = delta_tx
+                    .send(format!(
+                        "[Error: {}]",
+                        providers::sanitize_api_error(&e.to_string())
+                    ))
+                    .await;
+            }
+            Err(_) => {
+                tracing::error!("Webchat message timed out after {WEBCHAT_MESSAGE_TIMEOUT_SECS}s");
+                let _ = delta_tx
+                    .send("[Error: Request timed out]".to_string())
+                    .await;
+            }
+        }
+        // delta_tx drops here, closing the stream
+    });
+
+    // Convert mpsc receiver to SSE stream
+    let stream = ReceiverStream::new(delta_rx);
+    let sse_stream = SseDeltaStream {
+        inner: stream,
+        done: false,
+    };
+
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
+/// Wraps the delta stream into SSE events with `{delta, done}` JSON payloads.
+struct SseDeltaStream {
+    inner: ReceiverStream<String>,
+    done: bool,
+}
+
+impl Stream for SseDeltaStream {
+    type Item = Result<Event, std::convert::Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(delta)) => {
+                let data = serde_json::json!({"delta": delta, "done": false});
+                Poll::Ready(Some(Ok(Event::default().data(data.to_string()))))
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                let data = serde_json::json!({"delta": "", "done": true});
+                Poll::Ready(Some(Ok(Event::default().data(data.to_string()))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// GET /webchat/history — return session conversation history
+async fn handle_webchat_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<WebchatHistoryQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    authenticate_webchat(&state, &headers)?;
+
+    let Some(ref sessions) = state.webchat_sessions else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Webchat not configured"})),
+        ));
+    };
+
+    let history = sessions.get_history(&params.session_key);
+    let messages: Vec<serde_json::Value> = history
+        .iter()
+        .map(|msg| {
+            serde_json::json!({
+                "role": msg.role,
+                "content": msg.content,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({"messages": messages})))
+}
+
+/// DELETE /webchat/history — clear session conversation history
+async fn handle_webchat_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<WebchatHistoryQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    authenticate_webchat(&state, &headers)?;
+
+    let Some(ref sessions) = state.webchat_sessions else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Webchat not configured"})),
+        ));
+    };
+
+    let cleared = sessions.clear_session(&params.session_key);
+    Ok(Json(serde_json::json!({"cleared": cleared})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1466,9 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            webchat_sessions: None,
+            webchat_system_prompt: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1076,6 +1510,9 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer,
+            tools_registry: Arc::new(Vec::new()),
+            webchat_sessions: None,
+            webchat_system_prompt: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1427,6 +1864,9 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            webchat_sessions: None,
+            webchat_system_prompt: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1483,6 +1923,9 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            webchat_sessions: None,
+            webchat_system_prompt: None,
         };
 
         let headers = HeaderMap::new();
@@ -1548,6 +1991,9 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            webchat_sessions: None,
+            webchat_system_prompt: None,
         };
 
         let response = handle_webhook(
@@ -1586,6 +2032,9 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            webchat_sessions: None,
+            webchat_system_prompt: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1627,6 +2076,9 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            webchat_sessions: None,
+            webchat_system_prompt: None,
         };
 
         let mut headers = HeaderMap::new();

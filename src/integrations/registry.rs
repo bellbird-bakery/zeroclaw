@@ -121,7 +121,17 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "WebChat",
             description: "Browser-based chat UI",
             category: IntegrationCategory::Chat,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.channels_config
+                    .webchat
+                    .as_ref()
+                    .is_some_and(|wc| wc.enabled)
+                {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Nextcloud Talk",
